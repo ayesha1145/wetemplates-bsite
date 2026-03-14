@@ -35,7 +35,7 @@ from django.core.management import call_command
 from django.core.paginator import Paginator
 from django.db import IntegrityError, models, router, transaction
 from django.db.models import Avg, Count, Q, Sum
-from django.db.models.functions import Coalesce
+from django.db.models.functions import Coalesce, TruncDate, TruncWeek
 from django.http import (
     FileResponse,
     Http404,
@@ -2683,6 +2683,70 @@ def teacher_dashboard(request):
     # Get the teacher's storefront if it exists
     storefront = Storefront.objects.filter(teacher=request.user).first()
 
+    # Enrollment trend — last 30 days
+    today = timezone.now().date()
+    thirty_days_ago = today - timedelta(days=29)
+    start_dt = timezone.make_aware(timezone.datetime.combine(thirty_days_ago, timezone.datetime.min.time()))
+    enroll_qs = (
+        Enrollment.objects.filter(course__teacher=request.user, enrollment_date__gte=start_dt)
+        .annotate(day=TruncDate("enrollment_date"))
+        .values("day")
+        .annotate(count=Count("id"))
+        .order_by("day")
+    )
+    enroll_by_date = {e["day"].strftime("%b %d"): e["count"] for e in enroll_qs}
+    enroll_labels = []
+    enroll_data = []
+    for i in range(30):
+        day = thirty_days_ago + timedelta(days=i)
+        label = day.strftime("%b %d")
+        enroll_labels.append(label)
+        enroll_data.append(enroll_by_date.get(label, 0))
+
+    # Revenue trend — last 12 weeks (anchor to Monday for TruncWeek alignment)
+    twelve_weeks_ago = today - timedelta(days=today.weekday() + 77)  # 11 full weeks back, starting Monday
+    start_dt_12w = timezone.make_aware(timezone.datetime.combine(twelve_weeks_ago, timezone.datetime.min.time()))
+    revenue_qs = (
+        Payment.objects.filter(
+            enrollment__course__teacher=request.user,
+            status="completed",
+            created_at__gte=start_dt_12w,
+        )
+        .annotate(week=TruncWeek("created_at"))
+        .values("week")
+        .annotate(total=Sum("amount"))
+        .order_by("week")
+    )
+    revenue_by_week = {r["week"].strftime("%b %d"): float(r["total"]) for r in revenue_qs}
+    revenue_labels = []
+    revenue_data = []
+    for i in range(12):
+        week_start = twelve_weeks_ago + timedelta(weeks=i)
+        label = week_start.strftime("%b %d")
+        revenue_labels.append(label)
+        revenue_data.append(revenue_by_week.get(label, 0))
+
+    # Top 5 students by average completion percentage
+    top_students = []
+    enrollments_with_progress = Enrollment.objects.filter(
+        course__teacher=request.user, status="approved"
+    ).select_related("student", "course")
+    student_progress = {}
+    for enrollment in enrollments_with_progress:
+        try:
+            pct = enrollment.progress.completion_percentage
+        except CourseProgress.DoesNotExist:
+            pct = 0
+        uid = enrollment.student.id
+        if uid not in student_progress:
+            student_progress[uid] = {"student": enrollment.student, "total": 0, "count": 0}
+        student_progress[uid]["total"] += pct
+        student_progress[uid]["count"] += 1
+    for uid, data in student_progress.items():
+        avg = round(data["total"] / data["count"]) if data["count"] else 0
+        top_students.append({"student": data["student"], "avg_progress": avg, "courses": data["count"]})
+    top_students = sorted(top_students, key=lambda x: -x["avg_progress"])[:5]
+
     context = {
         "courses": courses,
         "upcoming_sessions": upcoming_sessions,
@@ -2691,6 +2755,11 @@ def teacher_dashboard(request):
         "completion_rate": (total_completed / total_students * 100) if total_students > 0 else 0,
         "total_earnings": round(total_earnings, 2),
         "storefront": storefront,
+        "enroll_labels": enroll_labels,
+        "enroll_data": enroll_data,
+        "revenue_labels": revenue_labels,
+        "revenue_data": revenue_data,
+        "top_students": top_students,
     }
     return render(request, "dashboard/teacher.html", context)
 
